@@ -21,10 +21,10 @@ jobs:
           echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> $GITHUB_ENV
 
-      - name: Build functions
+      - name: Install & build functions
         working-directory: apps/functions
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run build
 
       - name: Deploy functions

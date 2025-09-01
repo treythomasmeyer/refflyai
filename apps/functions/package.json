@@ -1,0 +1,13 @@
+{
+  "name": "rulebook-functions",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "firebase-functions": "^5.0.1"
+  },
+  "devDependencies": { "typescript": "^5.5.4" }
+}

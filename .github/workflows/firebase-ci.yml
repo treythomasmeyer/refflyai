@@ -1,0 +1,31 @@
+name: Firebase Functions CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm i -g firebase-tools jq
+
+      - name: Set project id from secret
+        run: echo '${{ secrets.FIREBASE_PROJECT_ID }}' > project.txt
+
+      - name: Use service account (from secret) for CLI auth
+        run: |
+          echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> $GITHUB_ENV
+
+      - name: Build functions
+        working-directory: apps/functions
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy functions
+        run: firebase deploy --only functions --project "$(cat project.txt)" --non-interactive

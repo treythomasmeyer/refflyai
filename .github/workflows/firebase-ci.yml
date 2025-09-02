@@ -17,7 +17,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Authenticate to Google Cloud using your service account JSON
+      # Authenticate to Google Cloud using the deployer SA JSON
       - name: Google Auth
         uses: google-github-actions/auth@v2
         with:
@@ -28,14 +28,13 @@ jobs:
         with:
           project_id: ${{ secrets.FIREBASE_PROJECT_ID }}
 
-      # Make a Firebase CLI token from gcloud and expose it to subsequent steps
       - name: Export FIREBASE_TOKEN from gcloud
         run: echo "FIREBASE_TOKEN=$(gcloud auth print-access-token)" >> $GITHUB_ENV
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # Sanity checks (helpful diagnostics)
+      # Sanity checks
       - name: Sanity - echo project id
         run: |
           echo "FIREBASE_PROJECT_ID (from secret): ${{ secrets.FIREBASE_PROJECT_ID }}"
@@ -45,9 +44,20 @@ jobs:
         run: |
           gcloud config list
           gcloud auth list
-          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)"
+          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)" || true
 
-      - name: Sanity - firebase can list projects
+      # Enable required APIs (needs roles/serviceusage.serviceUsageAdmin on the SA)
+      - name: Enable required Google APIs
+        run: |
+          gcloud services enable \
+            cloudresourcemanager.googleapis.com \
+            cloudfunctions.googleapis.com \
+            run.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            firebase.googleapis.com
+
+      - name: Sanity - list accessible projects
         run: firebase projects:list --non-interactive || true
 
       - name: Install & build functions
@@ -58,6 +68,5 @@ jobs:
 
       - name: Deploy functions
         env:
-          # Firebase CLI will use this token for auth
           FIREBASE_TOKEN: ${{ env.FIREBASE_TOKEN }}
         run: firebase deploy --only functions --project "${{ secrets.FIREBASE_PROJECT_ID }}" --non-interactive

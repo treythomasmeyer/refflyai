@@ -2,45 +2,41 @@ name: Firebase Functions CI
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # ─── Sanity steps (diagnostics) ────────────────────────────────────────────
-      - name: Sanity: echo secrets exist
+      # Sanity checks
+      - name: Sanity - echo project id
         run: |
           echo "FIREBASE_PROJECT_ID (from secret): ${{ secrets.FIREBASE_PROJECT_ID }}"
           test -n "${{ secrets.FIREBASE_PROJECT_ID }}" || (echo "FIREBASE_PROJECT_ID is empty" && exit 1)
 
-      - name: Sanity: write & inspect SA JSON
+      - name: Sanity - write and inspect SA JSON
         run: |
           echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
-          node -e "const sa=require('fs').readFileSync(process.env.HOME+'/sa.json','utf8'); const j=JSON.parse(sa); console.log('SA project_id:', j.project_id); console.log('SA client_email:', j.client_email);"
+          node -e "const fs=require('fs');const p=process.env.HOME+'/sa.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));console.log('SA project_id:', j.project_id);console.log('SA client_email:', j.client_email);"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> $GITHUB_ENV
 
-      - name: Sanity: list accessible projects with this SA
-        run: |
-          firebase projects:list --non-interactive || true
-      # ──────────────────────────────────────────────────────────────────────────
+      - name: Sanity - list accessible projects
+        run: firebase projects:list --non-interactive || true
 
       - name: Set project id from secret
         run: echo '${{ secrets.FIREBASE_PROJECT_ID }}' > project.txt
-
-      - name: Use service account (from secret) for CLI auth
-        run: |
-          echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> $GITHUB_ENV
 
       - name: Install & build functions
         working-directory: apps/functions

@@ -2,8 +2,7 @@ name: Firebase Functions CI
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   deploy:
@@ -17,7 +16,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Authenticate to Google Cloud using the deployer SA JSON
+      # Log into Google Cloud with your deployer SA (GCP_SA_KEY)
       - name: Google Auth
         uses: google-github-actions/auth@v2
         with:
@@ -28,37 +27,15 @@ jobs:
         with:
           project_id: ${{ secrets.FIREBASE_PROJECT_ID }}
 
-      - name: Export FIREBASE_TOKEN from gcloud
-        run: echo "FIREBASE_TOKEN=$(gcloud auth print-access-token)" >> $GITHUB_ENV
-
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # Sanity checks
-      - name: Sanity - echo project id
-        run: |
-          echo "FIREBASE_PROJECT_ID (from secret): ${{ secrets.FIREBASE_PROJECT_ID }}"
-          test -n "${{ secrets.FIREBASE_PROJECT_ID }}" || (echo "FIREBASE_PROJECT_ID is empty" && exit 1)
-
-      - name: Sanity - print SA identity
+      # (Optional) sanity
+      - name: Sanity - who am I / which project
         run: |
           gcloud config list
           gcloud auth list
-          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)" || true
-
-      # Enable required APIs (needs roles/serviceusage.serviceUsageAdmin on the SA)
-      - name: Enable required Google APIs
-        run: |
-          gcloud services enable \
-            cloudresourcemanager.googleapis.com \
-            cloudfunctions.googleapis.com \
-            run.googleapis.com \
-            cloudbuild.googleapis.com \
-            artifactregistry.googleapis.com \
-            firebase.googleapis.com
-
-      - name: Sanity - list accessible projects
-        run: firebase projects:list --non-interactive || true
+          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)"
 
       - name: Install & build functions
         working-directory: apps/functions
@@ -67,6 +44,4 @@ jobs:
           npm run build
 
       - name: Deploy functions
-        env:
-          FIREBASE_TOKEN: ${{ env.FIREBASE_TOKEN }}
         run: firebase deploy --only functions --project "${{ secrets.FIREBASE_PROJECT_ID }}" --non-interactive

@@ -17,26 +17,38 @@ jobs:
         with:
           node-version: '20'
 
+      # Authenticate to Google Cloud using your service account JSON
+      - name: Google Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.FIREBASE_PROJECT_ID }}
+
+      # Make a Firebase CLI token from gcloud and expose it to subsequent steps
+      - name: Export FIREBASE_TOKEN from gcloud
+        run: echo "FIREBASE_TOKEN=$(gcloud auth print-access-token)" >> $GITHUB_ENV
+
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # Sanity checks
+      # Sanity checks (helpful diagnostics)
       - name: Sanity - echo project id
         run: |
           echo "FIREBASE_PROJECT_ID (from secret): ${{ secrets.FIREBASE_PROJECT_ID }}"
           test -n "${{ secrets.FIREBASE_PROJECT_ID }}" || (echo "FIREBASE_PROJECT_ID is empty" && exit 1)
 
-      - name: Sanity - write and inspect SA JSON
+      - name: Sanity - print SA identity
         run: |
-          echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
-          node -e "const fs=require('fs');const p=process.env.HOME+'/sa.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));console.log('SA project_id:', j.project_id);console.log('SA client_email:', j.client_email);"
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> $GITHUB_ENV
+          gcloud config list
+          gcloud auth list
+          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)"
 
-      - name: Sanity - list accessible projects
+      - name: Sanity - firebase can list projects
         run: firebase projects:list --non-interactive || true
-
-      - name: Set project id from secret
-        run: echo '${{ secrets.FIREBASE_PROJECT_ID }}' > project.txt
 
       - name: Install & build functions
         working-directory: apps/functions
@@ -45,4 +57,7 @@ jobs:
           npm run build
 
       - name: Deploy functions
-        run: firebase deploy --only functions --project "$(cat project.txt)" --non-interactive
+        env:
+          # Firebase CLI will use this token for auth
+          FIREBASE_TOKEN: ${{ env.FIREBASE_TOKEN }}
+        run: firebase deploy --only functions --project "${{ secrets.FIREBASE_PROJECT_ID }}" --non-interactive

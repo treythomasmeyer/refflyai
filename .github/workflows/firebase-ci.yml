@@ -16,7 +16,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Log into Google Cloud with your deployer SA (GCP_SA_KEY)
+      # Authenticate to Google Cloud using the deployer SA JSON in GCP_SA_KEY
       - name: Google Auth
         uses: google-github-actions/auth@v2
         with:
@@ -30,12 +30,18 @@ jobs:
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # (Optional) sanity
+      # Sanity - make sure the SA & project match and Firebase is attached
       - name: Sanity - who am I / which project
         run: |
+          echo "FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}"
+          echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.env.HOME+'/sa.json','utf8'));console.log('SA project_id:', j.project_id);console.log('SA client_email:', j.client_email);"
           gcloud config list
           gcloud auth list
-          gcloud projects describe "${{ secrets.FIREBASE_PROJECT_ID }}" --format="value(projectNumber,projectId)"
+          # This will 404 if Firebase is not attached to the project
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+          curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://firebase.googleapis.com/v1beta1/projects/${{ secrets.FIREBASE_PROJECT_ID }}/adminSdkConfig" | jq || true
 
       - name: Install & build functions
         working-directory: apps/functions

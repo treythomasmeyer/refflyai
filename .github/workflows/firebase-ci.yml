@@ -16,7 +16,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Authenticate to Google Cloud using the deployer SA JSON in GCP_SA_KEY
+      # Auth to Google Cloud with the deployer SA from GCP_SA_KEY
       - name: Google Auth
         uses: google-github-actions/auth@v2
         with:
@@ -30,18 +30,30 @@ jobs:
       - name: Install Firebase CLI
         run: npm i -g firebase-tools jq
 
-      # Sanity - make sure the SA & project match and Firebase is attached
-      - name: Sanity - who am I / which project
+      # Guardrail: secrets sanity + Firebase attached check
+      - name: Sanity - SA project & Firebase attach
         run: |
-          echo "FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}"
           echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
-          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.env.HOME+'/sa.json','utf8'));console.log('SA project_id:', j.project_id);console.log('SA client_email:', j.client_email);"
-          gcloud config list
-          gcloud auth list
-          # This will 404 if Firebase is not attached to the project
+          SA_PROJECT=$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.env.HOME+'/sa.json','utf8'));process.stdout.write(j.project_id)")
+          echo "FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}"
+          echo "SA project_id: $SA_PROJECT"
+          test "$SA_PROJECT" = "${{ secrets.FIREBASE_PROJECT_ID }}" || (echo "❌ SA project_id does not match FIREBASE_PROJECT_ID" && exit 1)
           ACCESS_TOKEN=$(gcloud auth print-access-token)
-          curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://firebase.googleapis.com/v1beta1/projects/${{ secrets.FIREBASE_PROJECT_ID }}/adminSdkConfig" | jq || true
+          echo "Checking Firebase adminSdkConfig..."
+          curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://firebase.googleapis.com/v1beta1/projects/${{ secrets.FIREBASE_PROJECT_ID }}/adminSdkConfig" \
+            >/dev/null || (echo "❌ Project is not attached to Firebase. Attach it in Firebase Console and retry." && exit 1)
+
+      # (Optional) auto-enable APIs if your SA has Service Usage Admin
+      - name: Enable required Google APIs (optional)
+        run: |
+          gcloud services enable \
+            cloudfunctions.googleapis.com \
+            run.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            firebase.googleapis.com \
+            cloudresourcemanager.googleapis.com || true
 
       - name: Install & build functions
         working-directory: apps/functions

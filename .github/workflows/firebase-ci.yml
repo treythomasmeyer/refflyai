@@ -3,7 +3,7 @@ name: Firebase Functions CI
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - "apps/functions/**"
       - "firebase.json"
@@ -64,16 +64,18 @@ jobs:
       - name: Firebase auth check
         run: firebase --project "${FIREBASE_PROJECT_ID}" projects:list >/dev/null
 
-      - name: Install function deps
-        working-directory: apps/functions
-        run: npm ci || npm install
+      - name: Show workspace (debug)
+        run: |
+          pwd
+          ls -la
+          echo "--- apps/functions ---"
+          ls -la apps/functions || true
 
       - name: Sanity check Firebase config
         run: |
           test -f firebase.json && cat firebase.json
           test -f .firebaserc && cat .firebaserc
 
-      # Optional: non-blocking SDK config check (safe if no Web App ID is set)
       - name: Check Firebase Web App SDK config (non-blocking)
         run: |
           set -euo pipefail
@@ -87,9 +89,12 @@ jobs:
               echo "sdkconfig fetch failed, continuing."
           fi
 
+      - name: Install function deps
+        working-directory: apps/functions
+        run: npm ci || npm install
+
       - name: Deploy functions (gen2) with cleanup policy
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive --force
 
-      - name: Output function URLs
-      run: gcloud functions list --regions=us-central1 --format="table(name, url)"
-
+      - name: Output function URLs (gen2)
+        run: gcloud functions list --regions=us-central1 --format="table(name, url)"

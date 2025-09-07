@@ -1,3 +1,6 @@
 {
-  "functions": { "source": "apps/functions" }
+  "functions": {
+    "source": "apps/functions",
+    "runtime": "nodejs20"
+  }
 }

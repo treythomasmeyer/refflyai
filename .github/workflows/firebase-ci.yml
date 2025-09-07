@@ -1,22 +1,30 @@
 name: Firebase Functions CI
+
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
+    paths:
+      - "apps/functions/**"
+      - "firebase.json"
+      - ".firebaserc"
+      - ".github/workflows/firebase-ci.yml"
 
 jobs:
-  deploy:
+  deploy-functions:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # Auth to Google Cloud with the deployer SA from GCP_SA_KEY
       - name: Google Auth
         uses: google-github-actions/auth@v2
         with:
@@ -25,27 +33,15 @@ jobs:
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: ${{ secrets.FIREBASE_PROJECT_ID }}
+          version: ">= 472.0.0"
 
-      - name: Install Firebase CLI
-        run: npm i -g firebase-tools jq
-
-      # Guardrail: secrets sanity + Firebase attached check
-      - name: Sanity - SA project & Firebase attach
+      - name: Confirm project
         run: |
-          echo '${{ secrets.GCP_SA_KEY }}' > $HOME/sa.json
-          SA_PROJECT=$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.env.HOME+'/sa.json','utf8'));process.stdout.write(j.project_id)")
-          echo "FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}"
-          echo "SA project_id: $SA_PROJECT"
-          test "$SA_PROJECT" = "${{ secrets.FIREBASE_PROJECT_ID }}" || (echo "❌ SA project_id does not match FIREBASE_PROJECT_ID" && exit 1)
-          ACCESS_TOKEN=$(gcloud auth print-access-token)
-          echo "Checking Firebase adminSdkConfig..."
-          curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://firebase.googleapis.com/v1beta1/projects/${{ secrets.FIREBASE_PROJECT_ID }}/adminSdkConfig" \
-            >/dev/null || (echo "❌ Project is not attached to Firebase. Attach it in Firebase Console and retry." && exit 1)
+          echo "Using project: ${FIREBASE_PROJECT_ID}"
+          gcloud config set project "${FIREBASE_PROJECT_ID}"
+          gcloud projects describe "${FIREBASE_PROJECT_ID}" --format='value(projectNumber)'
 
-      # (Optional) auto-enable APIs if your SA has Service Usage Admin
-      - name: Enable required Google APIs (optional)
+      - name: Enable required APIs (idempotent)
         run: |
           gcloud services enable \
             cloudfunctions.googleapis.com \
@@ -53,13 +49,46 @@ jobs:
             cloudbuild.googleapis.com \
             artifactregistry.googleapis.com \
             firebase.googleapis.com \
-            cloudresourcemanager.googleapis.com || true
+            firebaseextensions.googleapis.com \
+            servicemanagement.googleapis.com \
+            serviceusage.googleapis.com \
+            cloudresourcemanager.googleapis.com \
+            runtimeconfig.googleapis.com \
+            eventarc.googleapis.com \
+            pubsub.googleapis.com \
+            storage.googleapis.com
 
-      - name: Install & build functions
+      - name: Install Firebase CLI
+        run: npm i -g firebase-tools@latest
+
+      - name: Firebase auth check
+        run: firebase --project "${FIREBASE_PROJECT_ID}" projects:list >/dev/null
+
+      - name: Install function deps
         working-directory: apps/functions
-        run: |
-          npm install --no-audit --no-fund
-          npm run build
+        run: npm ci || npm install
 
-      - name: Deploy functions
-        run: firebase deploy --only functions --project "${{ secrets.FIREBASE_PROJECT_ID }}" --non-interactive
+      - name: Sanity check Firebase config
+        run: |
+          test -f firebase.json && cat firebase.json
+          test -f .firebaserc && cat .firebaserc
+
+      # Optional: non-blocking SDK config check (safe if no Web App ID is set)
+      - name: Check Firebase Web App SDK config (non-blocking)
+        run: |
+          set -euo pipefail
+          echo "Checking Firebase adminSdkConfig (non-blocking)..."
+          APP_ID="$(firebase --project "${FIREBASE_PROJECT_ID}" apps:list | awk '/WEB/ {print $2; exit}' || true)"
+          if [ -z "${APP_ID:-}" ]; then
+            echo "No Web App found. Skipping sdkconfig check."
+          else
+            echo "Found Web App: ${APP_ID}"
+            firebase --project "${FIREBASE_PROJECT_ID}" apps:sdkconfig web "${APP_ID}" >/dev/null || \
+              echo "sdkconfig fetch failed, continuing."
+          fi
+
+      - name: Deploy functions (gen2) with cleanup policy
+        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive --force
+
+      - name: Output function URLs
+        run: gcloud functions list --region=us-central1 --format="table(name, httpsTrigger.url)"

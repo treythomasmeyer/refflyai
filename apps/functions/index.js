@@ -1,7 +1,6 @@
 /* apps/functions/index.js
  * RefflyAI — MLB Rulebook Search (Node 20, 2nd-gen Functions)
- * Features:
- * - Health check (rules_loaded, first_item_keys)
+ * - Health check (rules_loaded, first_item_keys, examples)
  * - GET /rulebook?q=... (or POST {q}) with limit/offset
  * - Friendly synthesized titles
  * - Consistent citations (rule_id or citation)
@@ -9,6 +8,7 @@
  * - Optional highlighting: &highlight=1 wraps matches with «…»
  * - Basic synonym expansion hook
  * - CORS allowlist (localhost + ready for reffly.com)
+ * Note: Avoids template literals to prevent CI templating conflicts.
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -24,12 +24,12 @@ const ALLOW_ORIGINS = new Set([
   "http://127.0.0.1:3000",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
-  // TODO: add production origins when ready:
+  // Add production origins when ready:
   // "https://www.reffly.com",
   // "https://reffly.com",
 ]);
 
-// Synonym map (very lightweight starter). Keys must be lowercase.
+// Synonym map (lightweight starter). Keys should be lowercase.
 const SYNONYMS = {
   "offensive interference": ["batter’s interference", "batter interference"],
   "batter interference": ["offensive interference", "batter’s interference"],
@@ -41,7 +41,6 @@ const SYNONYMS = {
 
 // ---- Load rules once per instance ----------------------------------------
 
-/** Co-located JSON: apps/functions/data/mlbrules.json */
 const RULES_PATH = path.join(__dirname, "data", "mlbrules.json");
 
 let RULES = [];
@@ -51,7 +50,7 @@ try {
   const raw = fs.readFileSync(RULES_PATH, "utf8");
   RULES = JSON.parse(raw);
   FIELD_KEYS = RULES.length ? Object.keys(RULES[0]) : [];
-  logger.info(`Loaded ${RULES.length} rules from ${RULES_PATH}`);
+  logger.info("Loaded " + RULES.length + " rules from " + RULES_PATH);
 } catch (err) {
   logger.error("Failed to load mlbrules.json", err);
   RULES = [];
@@ -60,17 +59,20 @@ try {
 
 // ---- Helpers --------------------------------------------------------------
 
-const clean = (s) =>
-  (s || "")
+function clean(s) {
+  return (s || "")
     .toString()
     .replace(/\s+/g, " ")
     .replace(/[^\S\r\n]+/g, " ")
     .trim();
+}
 
-const lc = (s) => (s || "").toString().toLowerCase();
+function lc(s) {
+  return (s || "").toString().toLowerCase();
+}
 
 function buildTitle(rule) {
-  // Try to produce a concise, human-friendly title
+  // Concise, human-friendly title assembled from multiple fields
   const parts = [];
   if (rule.parentRule) parts.push(clean(rule.parentRule));
   if (rule.title) parts.push(clean(rule.title));
@@ -81,7 +83,7 @@ function buildTitle(rule) {
 }
 
 function getCitation(rule) {
-  // Prefer explicit citation-ish fields, then fallback to id
+  // Prefer explicit citation fields, fallback to id
   const candidates = [
     rule.citation,
     rule.citation1,
@@ -89,22 +91,32 @@ function getCitation(rule) {
     rule.ruleId,
     rule.id,
   ].map(clean);
-  return candidates.find((x) => x) || "";
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i]) return candidates[i];
+  }
+  return "";
 }
 
 function expandQueryWithSynonyms(q) {
   const terms = [q];
   const base = lc(q);
-  Object.entries(SYNONYMS).forEach(([key, alts]) => {
-    if (base.includes(key)) {
-      alts.forEach((a) => terms.push(a));
+  Object.keys(SYNONYMS).forEach(function (key) {
+    if (base.indexOf(key) !== -1) {
+      SYNONYMS[key].forEach(function (alt) {
+        if (terms.indexOf(alt) === -1) terms.push(alt);
+      });
     }
   });
-  return Array.from(new Set(terms));
+  // uniqueness
+  const uniq = [];
+  for (let i = 0; i < terms.length; i++) {
+    if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
+  }
+  return uniq;
 }
 
 function scoreRule(rule, queries) {
-  // Simple keyword matching with light field boosts
+  // Simple keyword matching with light field weights
   const fields = {
     title: 3,
     subtitle: 2,
@@ -116,50 +128,48 @@ function scoreRule(rule, queries) {
 
   let score = 0;
   const blob = {};
-  for (const f of Object.keys(fields)) blob[f] = lc(clean(rule[f]));
+  Object.keys(fields).forEach(function (f) {
+    blob[f] = lc(clean(rule[f]));
+  });
 
-  for (const q of queries) {
-    const term = lc(q);
-    const termRe = new RegExp(`\\b${escapeRegExp(term)}\\b`, "i");
-    for (const [f, wt] of Object.entries(fields)) {
+  for (let qi = 0; qi < queries.length; qi++) {
+    const term = lc(queries[qi]);
+    const termRe = safeWordRegex(term);
+    Object.keys(fields).forEach(function (f) {
+      const wt = fields[f];
       const hay = blob[f] || "";
-      if (!hay) continue;
-      // whole word match gets a boost
-      if (termRe.test(hay)) score += 5 * wt;
-      // substring fallbacks
-      const idx = hay.indexOf(term);
-      if (idx >= 0) score += 1 * wt;
-    }
-    // Exact phrase boost inside content
-    if (blob.content && blob.content.includes(term)) score += 3;
+      if (!hay) return;
+      if (termRe && termRe.test(hay)) score += 5 * wt; // whole word
+      if (hay.indexOf(term) >= 0) score += 1 * wt; // substring
+    });
+    if (blob.content && blob.content.indexOf(term) !== -1) score += 3; // phrase in content
   }
 
   return score;
 }
 
-function makeExcerpt(text, queries, maxLen = 220) {
+function makeExcerpt(text, queries, maxLen) {
+  const MAX = maxLen || 220;
   const t = clean(text);
   if (!t) return "";
   const base = lc(t);
 
-  // Find first occurrence of any query
-  let pos = 0;
   let foundAt = -1;
-  for (const q of queries) {
-    const idx = base.indexOf(lc(q));
+  for (let i = 0; i < queries.length; i++) {
+    const q = lc(queries[i]);
+    const idx = base.indexOf(q);
     if (idx !== -1 && (foundAt === -1 || idx < foundAt)) {
       foundAt = idx;
     }
   }
 
   if (foundAt === -1) {
-    return t.length <= maxLen ? t : t.slice(0, maxLen - 1).trimEnd() + "…";
+    return t.length <= MAX ? t : t.slice(0, MAX - 1).trimEnd() + "…";
   }
 
-  // Center around the match
-  const PAD = Math.floor(maxLen / 2);
+  const PAD = Math.floor(MAX / 2);
   const start = Math.max(0, foundAt - PAD);
-  const end = Math.min(t.length, start + maxLen);
+  const end = Math.min(t.length, start + MAX);
   const snippet = t.slice(start, end).trim();
 
   return (start > 0 ? "… " : "") + snippet + (end < t.length ? " …" : "");
@@ -168,17 +178,16 @@ function makeExcerpt(text, queries, maxLen = 220) {
 function highlight(text, queries) {
   if (!text) return "";
   let out = text;
-  // wrap each unique term; keep it simple to avoid catastrophic regex
-  const seen = new Set();
-  for (const q of queries) {
-    const term = q.trim();
-    if (!term || seen.has(term)) continue;
-    seen.add(term);
+  const seen = {};
+  for (let i = 0; i < queries.length; i++) {
+    const term = (queries[i] || "").trim();
+    if (!term || seen[term]) continue;
+    seen[term] = true;
     try {
-      const re = new RegExp(`(${escapeRegExp(term)})`, "gi");
+      const re = new RegExp("(" + escapeRegExp(term) + ")", "gi");
       out = out.replace(re, "«$1»");
-    } catch {
-      // skip bad regex input
+    } catch (e) {
+      // skip invalid regex inputs
     }
   }
   return out;
@@ -188,8 +197,16 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function parseBool(v, def = false) {
-  if (v === undefined || v === null) return def;
+function safeWordRegex(term) {
+  try {
+    return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i");
+  } catch (e) {
+    return null;
+  }
+}
+
+function parseBool(v, def) {
+  if (v === undefined || v === null) return !!def;
   const s = String(v).toLowerCase();
   return s === "1" || s === "true" || s === "yes";
 }
@@ -201,7 +218,12 @@ function parseIntSafe(v, def) {
 
 // ---- Core search ----------------------------------------------------------
 
-function searchRules({ q, limit = 5, offset = 0, doHighlight = false }) {
+function searchRules(opts) {
+  const q = opts.q;
+  const limit = opts.limit || 5;
+  const offset = opts.offset || 0;
+  const doHighlight = !!opts.doHighlight;
+
   const rawQuery = clean(q || "");
   if (!rawQuery) {
     return { hits: 0, results: [] };
@@ -209,74 +231,103 @@ function searchRules({ q, limit = 5, offset = 0, doHighlight = false }) {
 
   const queries = expandQueryWithSynonyms(rawQuery);
 
-  // Score all rules (fast enough for ~1.2k in-memory)
-  const scored = RULES.map((r) => ({
-    r,
-    s: scoreRule(r, queries),
-  })).filter((x) => x.s > 0);
-
-  scored.sort((a, b) => b.s - a.s);
+  // Score and sort
+  const scored = [];
+  for (let i = 0; i < RULES.length; i++) {
+    const r = RULES[i];
+    const s = scoreRule(r, queries);
+    if (s > 0) scored.push({ r: r, s: s });
+  }
+  scored.sort(function (a, b) {
+    return b.s - a.s;
+  });
 
   const slice = scored.slice(offset, offset + limit);
 
-  const results = slice.map(({ r, s }) => {
+  const results = [];
+  for (let i = 0; i < slice.length; i++) {
+    const item = slice[i];
+    const r = item.r;
+    const s = item.s;
     const title = buildTitle(r);
     const citation = getCitation(r);
     const content = clean(r.content);
     let excerpt = makeExcerpt(content, queries, 240);
-
     if (doHighlight && excerpt) {
       excerpt = highlight(excerpt, queries);
     }
-
-    return {
-      id: String(r.id ?? r.rule_id ?? r.ruleId ?? ""),
-      title,
-      citation,
+    results.push({
+      id: String(r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))),
+      title: title,
+      citation: citation,
       score: s,
-      excerpt,
-    };
-  });
+      excerpt: excerpt,
+    });
+  }
 
-  return { hits: scored.length, results };
+  return { hits: scored.length, results: results };
 }
 
 // ---- HTTP handler ---------------------------------------------------------
 
-exports.rulebook = onRequest({ region: REGION }, async (req, res) => {
+exports.rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
     // CORS
     const origin = req.headers.origin || "";
     if (ALLOW_ORIGINS.has(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
-      res.setHeader(
-        "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Requested-With"
-      );
-      res.setHeader(
-        "Access-Control-Allow-Methods",
-        "GET, POST, OPTIONS"
-      );
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
       res.setHeader("Access-Control-Max-Age", "86400");
     }
     if (req.method === "OPTIONS") {
       return res.status(204).end();
     }
 
-    // Health check (no q)
+    // Health check if no query provided
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
-      (req.method === "POST" &&
-        (req.body?.q || req.body?.query));
+      (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
 
     if (!q) {
+      const example1 = req.protocol + "://" + req.get("host") + req.baseUrl + "?q=interference";
+      const example2 = req.protocol + "://" + req.get("host") + req.baseUrl + "?q=infield+fly&limit=3&highlight=1";
       return res.status(200).json({
         ok: true,
-        message:
-          'RefflyAI rulebook is live. Pass ?q=your+question or POST {"q": "..."}',
+        message: "RefflyAI rulebook is live. Pass ?q=your+question or POST {\"q\": \"...\"}",
         rules_loaded: RULES.length,
         first_item_keys: FIELD_KEYS.slice(0, 9),
-        examples: [
-          `${req.protocol}://${req.get("host")}${req.baseUrl}?q=interference`,
-          `${req.protocol}://${req.get("host")}${req.b
+        examples: [example1, example2],
+      });
+    }
+
+    // Params
+    const limit = parseIntSafe(req.query.limit, 5);
+    const offset = parseIntSafe(req.query.offset, 0);
+    const highlightFlag = parseBool(req.query.highlight, false);
+
+    const result = searchRules({
+      q: q,
+      limit: limit,
+      offset: offset,
+      doHighlight: highlightFlag,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      query: q,
+      limit: limit,
+      offset: offset,
+      highlight: highlightFlag,
+      hits: result.hits,
+      results: result.results,
+    });
+  } catch (err) {
+    logger.error("rulebook error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Internal error",
+    });
+  }
+});

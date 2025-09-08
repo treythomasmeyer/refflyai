@@ -1,20 +1,25 @@
-/* apps/functions/index.js
- * RefflyAI — MLB Rulebook Search (Node 20, 2nd-gen Functions)
+/* apps/functions/index.js  (ESM)
+ * RefflyAI — MLB Rulebook Search (Node 20, 2nd-gen Functions, ESM)
  * - Health check (rules_loaded, first_item_keys, examples)
- * - GET /rulebook?q=... (or POST {q}) with limit/offset
+ * - GET /rulebook?q=...  (or POST {q}) with limit/offset
  * - Friendly synthesized titles
  * - Consistent citations (rule_id or citation)
  * - Clean excerpts
  * - Optional highlighting: &highlight=1 wraps matches with «…»
  * - Basic synonym expansion hook
  * - CORS allowlist (localhost + ready for reffly.com)
- * Note: Avoids template literals to prevent CI templating conflicts.
+ * - No template literals to avoid CI masking/templating quirks
  */
 
-const { onRequest } = require("firebase-functions/v2/https");
-const logger = require("firebase-functions/logger");
-const path = require("path");
-const fs = require("fs");
+import { onRequest } from "firebase-functions/v2/https";
+import * as logger from "firebase-functions/logger";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+
+// ---- ESM __dirname shim ---------------------------------------------------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ---- Config ---------------------------------------------------------------
 
@@ -107,7 +112,7 @@ function expandQueryWithSynonyms(q) {
       });
     }
   });
-  // uniqueness
+  // de-dup
   const uniq = [];
   for (let i = 0; i < terms.length; i++) {
     if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
@@ -115,8 +120,20 @@ function expandQueryWithSynonyms(q) {
   return uniq;
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function safeWordRegex(term) {
+  try {
+    return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i");
+  } catch (e) {
+    return null;
+  }
+}
+
 function scoreRule(rule, queries) {
-  // Simple keyword matching with light field weights
+  // Simple keyword scoring with light field weights
   const fields = {
     title: 3,
     subtitle: 2,
@@ -193,18 +210,6 @@ function highlight(text, queries) {
   return out;
 }
 
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function safeWordRegex(term) {
-  try {
-    return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i");
-  } catch (e) {
-    return null;
-  }
-}
-
 function parseBool(v, def) {
   if (v === undefined || v === null) return !!def;
   const s = String(v).toLowerCase();
@@ -257,7 +262,9 @@ function searchRules(opts) {
       excerpt = highlight(excerpt, queries);
     }
     results.push({
-      id: String(r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))),
+      id: String(
+        r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))
+      ),
       title: title,
       citation: citation,
       score: s,
@@ -268,9 +275,9 @@ function searchRules(opts) {
   return { hits: scored.length, results: results };
 }
 
-// ---- HTTP handler ---------------------------------------------------------
+// ---- HTTP handler (ESM export) -------------------------------------------
 
-exports.rulebook = onRequest({ region: REGION }, async function (req, res) {
+export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
     // CORS
     const origin = req.headers.origin || "";

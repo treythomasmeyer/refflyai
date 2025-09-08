@@ -1,14 +1,11 @@
-/* apps/functions/index.js  (ESM)
- * RefflyAI — MLB Rulebook Search (Node 20, 2nd-gen Functions, ESM)
- * - Health check (rules_loaded, first_item_keys, examples)
- * - GET /rulebook?q=...  (or POST {q}) with limit/offset
- * - Friendly synthesized titles
- * - Consistent citations (rule_id or citation)
- * - Clean excerpts
- * - Optional highlighting: &highlight=1 wraps matches with «…»
- * - Basic synonym expansion hook
- * - CORS allowlist (localhost + ready for reffly.com)
- * - No template literals to avoid CI masking/templating quirks
+/* apps/functions/index.js  (ESM, Node 20, 2nd-gen Functions)
+ * RefflyAI — MLB Rulebook Search
+ * - GET/POST /rulebook?q=... with ?limit & ?offset; &highlight=1 to mark matches as «like this»
+ * - Friendlier titles & consistent citations
+ * - Lightweight synonyms
+ * - CORS: localhost + ANY *.vercel.app (preview & prod)
+ * - Structured logs
+ * - No template literals (avoids CI masking quirks)
  */
 
 import { onRequest } from "firebase-functions/v2/https";
@@ -17,24 +14,36 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 
-// ---- ESM __dirname shim ---------------------------------------------------
+// --- ESM __dirname shim ----------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Config ---------------------------------------------------------------
-
+// --- Config ----------------------------------------------------------------
 const REGION = "us-central1";
-const ALLOW_ORIGINS = new Set([
+
+// Exact dev origins
+const ALLOW_EXACT = new Set([
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
-  // Add production origins when ready:
+  // Add your production domains later if you want to allow them explicitly:
   // "https://www.reffly.com",
   // "https://reffly.com",
 ]);
 
-// Synonym map (lightweight starter). Keys should be lowercase.
+// Allow Vercel previews/production: *.vercel.app
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOW_EXACT.has(origin)) return true;
+  try {
+    const u = new URL(origin);
+    if (u.hostname.endsWith(".vercel.app")) return true;
+  } catch (_e) {}
+  return false;
+}
+
+// --- Synonyms (starter) ----------------------------------------------------
 const SYNONYMS = {
   "offensive interference": ["batter’s interference", "batter interference"],
   "batter interference": ["offensive interference", "batter’s interference"],
@@ -44,8 +53,7 @@ const SYNONYMS = {
   "infield fly": ["ifr", "infield fly rule"],
 };
 
-// ---- Load rules once per instance ----------------------------------------
-
+// --- Load rulebook JSON once per instance ---------------------------------
 const RULES_PATH = path.join(__dirname, "data", "mlbrules.json");
 
 let RULES = [];
@@ -55,29 +63,21 @@ try {
   const raw = fs.readFileSync(RULES_PATH, "utf8");
   RULES = JSON.parse(raw);
   FIELD_KEYS = RULES.length ? Object.keys(RULES[0]) : [];
-  logger.info("Loaded " + RULES.length + " rules from " + RULES_PATH);
+  logger.info("rulebook_loaded", { count: RULES.length });
 } catch (err) {
-  logger.error("Failed to load mlbrules.json", err);
+  logger.error("rulebook_load_failed", { error: String(err) });
   RULES = [];
   FIELD_KEYS = [];
 }
 
-// ---- Helpers --------------------------------------------------------------
-
+// --- Helpers ---------------------------------------------------------------
 function clean(s) {
-  return (s || "")
-    .toString()
-    .replace(/\s+/g, " ")
-    .replace(/[^\S\r\n]+/g, " ")
-    .trim();
+  return (s || "").toString().replace(/\s+/g, " ").replace(/[^\S\r\n]+/g, " ").trim();
 }
-
 function lc(s) {
   return (s || "").toString().toLowerCase();
 }
-
 function buildTitle(rule) {
-  // Concise, human-friendly title assembled from multiple fields
   const parts = [];
   if (rule.parentRule) parts.push(clean(rule.parentRule));
   if (rule.title) parts.push(clean(rule.title));
@@ -86,22 +86,13 @@ function buildTitle(rule) {
   const joined = parts.join(" — ");
   return joined || clean(rule.subtitle) || "Rule";
 }
-
 function getCitation(rule) {
-  // Prefer explicit citation fields, fallback to id
-  const candidates = [
-    rule.citation,
-    rule.citation1,
-    rule.rule_id,
-    rule.ruleId,
-    rule.id,
-  ].map(clean);
+  const candidates = [rule.citation, rule.citation1, rule.rule_id, rule.ruleId, rule.id].map(clean);
   for (let i = 0; i < candidates.length; i++) {
     if (candidates[i]) return candidates[i];
   }
   return "";
 }
-
 function expandQueryWithSynonyms(q) {
   const terms = [q];
   const base = lc(q);
@@ -112,43 +103,27 @@ function expandQueryWithSynonyms(q) {
       });
     }
   });
-  // de-dup
   const uniq = [];
-  for (let i = 0; i < terms.length; i++) {
-    if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
-  }
+  for (let i = 0; i < terms.length; i++) if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
   return uniq;
 }
-
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-
 function safeWordRegex(term) {
   try {
     return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i");
-  } catch (e) {
+  } catch (_e) {
     return null;
   }
 }
-
 function scoreRule(rule, queries) {
-  // Simple keyword scoring with light field weights
-  const fields = {
-    title: 3,
-    subtitle: 2,
-    content: 4,
-    references: 1,
-    parentRule: 2,
-    subsection: 2,
-  };
-
+  const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
   const blob = {};
   Object.keys(fields).forEach(function (f) {
     blob[f] = lc(clean(rule[f]));
   });
-
   for (let qi = 0; qi < queries.length; qi++) {
     const term = lc(queries[qi]);
     const termRe = safeWordRegex(term);
@@ -159,39 +134,28 @@ function scoreRule(rule, queries) {
       if (termRe && termRe.test(hay)) score += 5 * wt; // whole word
       if (hay.indexOf(term) >= 0) score += 1 * wt; // substring
     });
-    if (blob.content && blob.content.indexOf(term) !== -1) score += 3; // phrase in content
+    if (blob.content && blob.content.indexOf(term) !== -1) score += 3;
   }
-
   return score;
 }
-
 function makeExcerpt(text, queries, maxLen) {
   const MAX = maxLen || 220;
   const t = clean(text);
   if (!t) return "";
   const base = lc(t);
-
   let foundAt = -1;
   for (let i = 0; i < queries.length; i++) {
     const q = lc(queries[i]);
     const idx = base.indexOf(q);
-    if (idx !== -1 && (foundAt === -1 || idx < foundAt)) {
-      foundAt = idx;
-    }
+    if (idx !== -1 && (foundAt === -1 || idx < foundAt)) foundAt = idx;
   }
-
-  if (foundAt === -1) {
-    return t.length <= MAX ? t : t.slice(0, MAX - 1).trimEnd() + "…";
-  }
-
+  if (foundAt === -1) return t.length <= MAX ? t : t.slice(0, MAX - 1).trimEnd() + "…";
   const PAD = Math.floor(MAX / 2);
   const start = Math.max(0, foundAt - PAD);
   const end = Math.min(t.length, start + MAX);
   const snippet = t.slice(start, end).trim();
-
   return (start > 0 ? "… " : "") + snippet + (end < t.length ? " …" : "");
 }
-
 function highlight(text, queries) {
   if (!text) return "";
   let out = text;
@@ -203,26 +167,21 @@ function highlight(text, queries) {
     try {
       const re = new RegExp("(" + escapeRegExp(term) + ")", "gi");
       out = out.replace(re, "«$1»");
-    } catch (e) {
-      // skip invalid regex inputs
-    }
+    } catch (_e) {}
   }
   return out;
 }
-
 function parseBool(v, def) {
   if (v === undefined || v === null) return !!def;
   const s = String(v).toLowerCase();
   return s === "1" || s === "true" || s === "yes";
 }
-
 function parseIntSafe(v, def) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) && n >= 0 ? n : def;
 }
 
-// ---- Core search ----------------------------------------------------------
-
+// --- Core search -----------------------------------------------------------
 function searchRules(opts) {
   const q = opts.q;
   const limit = opts.limit || 5;
@@ -230,13 +189,10 @@ function searchRules(opts) {
   const doHighlight = !!opts.doHighlight;
 
   const rawQuery = clean(q || "");
-  if (!rawQuery) {
-    return { hits: 0, results: [] };
-  }
+  if (!rawQuery) return { hits: 0, results: [] };
 
   const queries = expandQueryWithSynonyms(rawQuery);
 
-  // Score and sort
   const scored = [];
   for (let i = 0; i < RULES.length; i++) {
     const r = RULES[i];
@@ -248,7 +204,6 @@ function searchRules(opts) {
   });
 
   const slice = scored.slice(offset, offset + limit);
-
   const results = [];
   for (let i = 0; i < slice.length; i++) {
     const item = slice[i];
@@ -258,9 +213,7 @@ function searchRules(opts) {
     const citation = getCitation(r);
     const content = clean(r.content);
     let excerpt = makeExcerpt(content, queries, 240);
-    if (doHighlight && excerpt) {
-      excerpt = highlight(excerpt, queries);
-    }
+    if (doHighlight && excerpt) excerpt = highlight(excerpt, queries);
     results.push({
       id: String(
         r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))
@@ -275,13 +228,12 @@ function searchRules(opts) {
   return { hits: scored.length, results: results };
 }
 
-// ---- HTTP handler (ESM export) -------------------------------------------
-
+// --- HTTP handler ----------------------------------------------------------
 export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
     // CORS
     const origin = req.headers.origin || "";
-    if (ALLOW_ORIGINS.has(origin)) {
+    if (isAllowedOrigin(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
@@ -292,7 +244,7 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
       return res.status(204).end();
     }
 
-    // Health check if no query provided
+    // Health-like response if no query provided
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
       (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
@@ -321,6 +273,9 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
       doHighlight: highlightFlag,
     });
 
+    // Structured log
+    logger.info({ event: "search", q: q, hits: result.hits, limit: limit, offset: offset });
+
     return res.status(200).json({
       ok: true,
       query: q,
@@ -331,10 +286,7 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
       results: result.results,
     });
   } catch (err) {
-    logger.error("rulebook error", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal error",
-    });
+    logger.error("rulebook_error", { error: String(err) });
+    return res.status(500).json({ ok: false, error: "Internal error" });
   }
 });

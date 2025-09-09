@@ -3,7 +3,7 @@
  * - GET/POST /rulebook?q=... with ?limit & ?offset; &highlight=1
  * - Friendlier titles & consistent citations
  * - Lightweight synonyms
- * - CORS: OPEN (Access-Control-Allow-Origin: *) for quick unblock
+ * - CORS: allow your prod domain, any *.vercel.app preview, and localhost dev
  * - Structured logs
  * - No template literals (avoids CI masking quirks)
  */
@@ -20,6 +20,26 @@ const __dirname = path.dirname(__filename);
 
 // --- Config ----------------------------------------------------------------
 const REGION = "us-central1";
+
+// Exact dev/prod origins
+const ALLOW_EXACT = new Set([
+  "https://reffly-search.vercel.app", // production URL
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+]);
+
+// Allow Vercel preview deployments: *.vercel.app
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOW_EXACT.has(origin)) return true;
+  try {
+    const u = new URL(origin);
+    if (u.hostname.endsWith(".vercel.app")) return true;
+  } catch (_e) {}
+  return false;
+}
 
 // --- Synonyms (starter) ----------------------------------------------------
 const SYNONYMS = {
@@ -41,7 +61,7 @@ try {
   const raw = fs.readFileSync(RULES_PATH, "utf8");
   RULES = JSON.parse(raw);
   FIELD_KEYS = RULES.length ? Object.keys(RULES[0]) : [];
-  logger.info("rulebook_loaded", { count: RULES.length });
+  logger.info("rulebook_loaded", { count: RULES.length, path: RULES_PATH });
 } catch (err) {
   logger.error("rulebook_load_failed", { error: String(err) });
   RULES = [];
@@ -86,7 +106,7 @@ function expandQueryWithSynonyms(q) {
   return uniq;
 }
 function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function safeWordRegex(term) { try { return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i"); } catch { return null; } }
+function safeWordRegex(term) { try { return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i"); } catch (_e) { return null; } }
 function scoreRule(rule, queries) {
   const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
@@ -96,17 +116,18 @@ function scoreRule(rule, queries) {
     const term = lc(queries[qi]);
     const termRe = safeWordRegex(term);
     Object.keys(fields).forEach(function (f) {
-      const wt = fields[f]; const hay = blob[f] || "";
+      const wt = fields[f];
+      const hay = blob[f] || "";
       if (!hay) return;
-      if (termRe && termRe.test(hay)) score += 5 * wt;
-      if (hay.indexOf(term) >= 0) score += 1 * wt;
+      if (termRe && termRe.test(hay)) score += 5 * wt; // whole word
+      if (hay.indexOf(term) >= 0) score += 1 * wt;     // substring
     });
     if (blob.content && blob.content.indexOf(term) !== -1) score += 3;
   }
   return score;
 }
 function makeExcerpt(text, queries, maxLen) {
-  const MAX = maxLen || 220;
+  const MAX = maxLen || 240;
   const t = clean(text);
   if (!t) return "";
   const base = lc(t);
@@ -126,8 +147,9 @@ function highlight(text, queries) {
   if (!text) return "";
   let out = text; const seen = {};
   for (let i = 0; i < queries.length; i++) {
-    const term = (queries[i] || "").trim(); if (!term || seen[term]) continue; seen[term] = true;
-    try { const re = new RegExp("(" + escapeRegExp(term) + ")", "gi"); out = out.replace(re, "«$1»"); } catch {}
+    const term = (queries[i] || "").trim(); if (!term || seen[term]) continue;
+    seen[term] = true;
+    try { const re = new RegExp("(" + escapeRegExp(term) + ")", "gi"); out = out.replace(re, "«$1»"); } catch (_e) {}
   }
   return out;
 }
@@ -167,26 +189,34 @@ function searchRules(opts) {
     if (doHighlight && excerpt) excerpt = highlight(excerpt, queries);
     results.push({
       id: String(r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))),
-      title, citation, score: s, excerpt
+      title: title,
+      citation: citation,
+      score: s,
+      excerpt: excerpt,
     });
   }
-  return { hits: scored.length, results };
+  return { hits: scored.length, results: results };
 }
 
 // --- HTTP handler ----------------------------------------------------------
 export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
-    // OPEN CORS (for debugging / bring-up)
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Max-Age", "86400");
+    // Strict CORS
+    const origin = req.headers.origin || "";
+    if (isAllowedOrigin(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Max-Age", "86400");
+    }
     if (req.method === "OPTIONS") return res.status(204).end();
 
     // Health-like response if no query provided
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
       (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
+
     if (!q) {
       const example1 = "https://us-central1-primal-prism-471217-c5.cloudfunctions.net/rulebook?q=interference";
       const example2 = "https://us-central1-primal-prism-471217-c5.cloudfunctions.net/rulebook?q=infield+fly&limit=3&highlight=1";
@@ -204,14 +234,19 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
     const offset = parseIntSafe(req.query.offset, 0);
     const highlightFlag = parseBool(req.query.highlight, false);
 
-    const result = searchRules({ q, limit, offset, doHighlight: highlightFlag });
+    const result = searchRules({ q: q, limit: limit, offset: offset, doHighlight: highlightFlag });
 
     // Structured log
-    logger.info({ event: "search", q, hits: result.hits, limit, offset });
+    logger.info({ event: "search", q: q, hits: result.hits, limit: limit, offset: offset });
 
     return res.status(200).json({
-      ok: true, query: q, limit, offset, highlight: highlightFlag,
-      hits: result.hits, results: result.results,
+      ok: true,
+      query: q,
+      limit: limit,
+      offset: offset,
+      highlight: highlightFlag,
+      hits: result.hits,
+      results: result.results,
     });
   } catch (err) {
     logger.error("rulebook_error", { error: String(err) });

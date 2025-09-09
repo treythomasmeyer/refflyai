@@ -1,8 +1,12 @@
 /* apps/functions/index.js  (ESM, Node 20, 2nd-gen Functions)
  * RefflyAI — MLB Rulebook Search
- * - GET/POST /rulebook?q=... with ?limit & ?offset; &highlight=1
- * - Friendlier titles & consistent citations
- * - Lightweight synonyms
+ * Endpoints:
+ *   - GET/POST /rulebook?q=... [&limit=&offset=&highlight=1]
+ *   - GET/POST /suggest?q=... [&limit=]
+ *
+ * Features:
+ * - Friendlier titles & citations
+ * - Synonyms loaded from data/synonyms.json (with safe defaults fallback)
  * - CORS: PRODUCTION ONLY (https://reffly-search.vercel.app)
  * - Structured logs
  * - No template literals (avoids CI masking quirks)
@@ -27,16 +31,6 @@ function isAllowedOrigin(origin) {
   return origin === PROD_ORIGIN;
 }
 
-// --- Synonyms (starter) ----------------------------------------------------
-const SYNONYMS = {
-  "offensive interference": ["batter’s interference", "batter interference"],
-  "batter interference": ["offensive interference", "batter’s interference"],
-  "balks": ["balk"],
-  "tag up": ["retouch", "time play"],
-  "obstruction": ["fielder obstruction"],
-  "infield fly": ["ifr", "infield fly rule"],
-};
-
 // --- Load rulebook JSON once per instance ---------------------------------
 const RULES_PATH = path.join(__dirname, "data", "mlbrules.json");
 
@@ -54,13 +48,58 @@ try {
   FIELD_KEYS = [];
 }
 
+// --- Synonyms --------------------------------------------------------------
+// Safe defaults; can be overridden/extended by data/synonyms.json
+const DEFAULT_SYNONYMS = {
+  "offensive interference": ["batter interference", "batters interference", "batter’s interference"],
+  "batter interference": ["offensive interference", "batter’s interference"],
+  "catcher's interference": ["catchers interference", "batter interference", "offensive interference"],
+  "obstruction": ["fielder obstruction", "obstructing the runner"],
+  "infield fly": ["infield fly rule", "ifr"],
+  "ifr": ["infield fly", "infield fly rule"],
+  "balks": ["balk"],
+  "tag up": ["retouch", "time play"],
+  "appeal play": ["appeal"],
+  "force play": ["force out"],
+  "time play": ["timing play"],
+  "foul tip": ["caught foul tip"],
+  "ground-rule double": ["automatic double"],
+  "dead ball": ["ball is dead"],
+  "check swing": ["swing attempt", "did he go"],
+  "bunt attempt": ["offer at bunt", "squared to bunt"]
+};
+function isArrayOfStrings(v) {
+  if (!Array.isArray(v)) return false;
+  for (let i = 0; i < v.length; i++) if (typeof v[i] !== "string") return false;
+  return true;
+}
+const SYN_PATH = path.join(__dirname, "data", "synonyms.json");
+let SYNONYMS = { ...DEFAULT_SYNONYMS };
+try {
+  const synRaw = fs.readFileSync(SYN_PATH, "utf8");
+  const fileSyn = JSON.parse(synRaw);
+  if (fileSyn && typeof fileSyn === "object" && !Array.isArray(fileSyn)) {
+    const merged = { ...DEFAULT_SYNONYMS };
+    const keys = Object.keys(fileSyn);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = fileSyn[k];
+      if (typeof k === "string" && isArrayOfStrings(v)) merged[k] = v;
+    }
+    SYNONYMS = merged;
+    logger.info("synonyms_loaded", { entries: Object.keys(SYNONYMS).length, path: SYN_PATH });
+  } else {
+    logger.warn("synonyms_invalid_format", { path: SYN_PATH });
+  }
+} catch (e) {
+  logger.info("synonyms_file_not_loaded", { path: SYN_PATH, note: "using defaults", error: String(e) });
+}
+
 // --- Helpers ---------------------------------------------------------------
 function clean(s) {
   return (s || "").toString().replace(/\s+/g, " ").replace(/[^\S\r\n]+/g, " ").trim();
 }
-function lc(s) {
-  return (s || "").toString().toLowerCase();
-}
+function lc(s) { return (s || "").toString().toLowerCase(); }
 function buildTitle(rule) {
   const parts = [];
   if (rule.parentRule) parts.push(clean(rule.parentRule));
@@ -72,21 +111,21 @@ function buildTitle(rule) {
 }
 function getCitation(rule) {
   const candidates = [rule.citation, rule.citation1, rule.rule_id, rule.ruleId, rule.id].map(clean);
-  for (let i = 0; i < candidates.length; i++) {
-    if (candidates[i]) return candidates[i];
-  }
+  for (let i = 0; i < candidates.length; i++) if (candidates[i]) return candidates[i];
   return "";
 }
 function expandQueryWithSynonyms(q) {
   const terms = [q];
   const base = lc(q);
-  Object.keys(SYNONYMS).forEach(function (key) {
+  const keys = Object.keys(SYNONYMS);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
     if (base.indexOf(key) !== -1) {
-      SYNONYMS[key].forEach(function (alt) {
-        if (terms.indexOf(alt) === -1) terms.push(alt);
-      });
+      const alts = SYNONYMS[key];
+      for (let j = 0; j < alts.length; j++) if (terms.indexOf(alts[j]) === -1) terms.push(alts[j]);
     }
-  });
+  }
+  // uniq
   const uniq = [];
   for (let i = 0; i < terms.length; i++) if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
   return uniq;
@@ -97,17 +136,22 @@ function scoreRule(rule, queries) {
   const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
   const blob = {};
-  Object.keys(fields).forEach(function (f) { blob[f] = lc(clean(rule[f])); });
+  const fks = Object.keys(fields);
+  for (let i = 0; i < fks.length; i++) {
+    const f = fks[i];
+    blob[f] = lc(clean(rule[f]));
+  }
   for (let qi = 0; qi < queries.length; qi++) {
     const term = lc(queries[qi]);
     const termRe = safeWordRegex(term);
-    Object.keys(fields).forEach(function (f) {
+    for (let k = 0; k < fks.length; k++) {
+      const f = fks[k];
       const wt = fields[f];
       const hay = blob[f] || "";
-      if (!hay) return;
+      if (!hay) continue;
       if (termRe && termRe.test(hay)) score += 5 * wt;
       if (hay.indexOf(term) >= 0) score += 1 * wt;
-    });
+    }
     if (blob.content && blob.content.indexOf(term) !== -1) score += 3;
   }
   return score;
@@ -184,21 +228,77 @@ function searchRules(opts) {
   return { hits: scored.length, results: results };
 }
 
-// --- HTTP handler ----------------------------------------------------------
+// --- Suggest (typeahead) ---------------------------------------------------
+function suggestRules(opts) {
+  const q = clean(opts.q || "");
+  const limit = opts.limit || 8;
+  if (!q) return [];
+
+  const queries = expandQueryWithSynonyms(q);
+
+  // Heavier weight on title/citation for suggestions
+  function scoreForSuggest(rule) {
+    const title = lc(buildTitle(rule));
+    const cit = lc(getCitation(rule));
+    const content = lc(clean(rule.content));
+    let s = 0;
+    for (let i = 0; i < queries.length; i++) {
+      const term = lc(queries[i]);
+      const re = safeWordRegex(term);
+      if (re && re.test(title)) s += 20;
+      if (re && re.test(cit)) s += 12;
+      if (title.indexOf(term) !== -1) s += 6;
+      if (cit.indexOf(term) !== -1) s += 4;
+      if (content.indexOf(term) !== -1) s += 1;
+    }
+    return s;
+  }
+
+  const scored = [];
+  for (let i = 0; i < RULES.length; i++) {
+    const r = RULES[i];
+    const s = scoreForSuggest(r);
+    if (s > 0) scored.push({ r: r, s: s });
+  }
+  scored.sort(function (a, b) { return b.s - a.s; });
+
+  // Unique by title+citation to avoid dup rows
+  const seen = {};
+  const out = [];
+  for (let i = 0; i < scored.length && out.length < limit; i++) {
+    const r = scored[i].r;
+    const title = buildTitle(r);
+    const citation = getCitation(r);
+    const key = title + " | " + citation;
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push({
+      id: String(r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))),
+      title: title || "Rule",
+      citation: citation || "",
+    });
+  }
+  return out;
+}
+
+// --- CORS helper -----------------------------------------------------------
+function applyCors(req, res) {
+  const origin = req.headers.origin || "";
+  if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+}
+
+// --- HTTP handlers ---------------------------------------------------------
 export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
-    // Strict CORS (prod only)
-    const origin = req.headers.origin || "";
-    if (isAllowedOrigin(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Max-Age", "86400");
-    }
+    applyCors(req, res);
     if (req.method === "OPTIONS") return res.status(204).end();
 
-    // Health-like response if no query provided
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
       (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
@@ -215,27 +315,52 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
       });
     }
 
-    // Params
     const limit = parseIntSafe(req.query.limit, 5);
     const offset = parseIntSafe(req.query.offset, 0);
     const highlightFlag = parseBool(req.query.highlight, false);
 
     const result = searchRules({ q: q, limit: limit, offset: offset, doHighlight: highlightFlag });
 
-    // Structured log
     logger.info({ event: "search", q: q, hits: result.hits, limit: limit, offset: offset });
+    return res.status(200).json({
+      ok: true, query: q, limit: limit, offset: offset, highlight: highlightFlag,
+      hits: result.hits, results: result.results,
+    });
+  } catch (err) {
+    logger.error("rulebook_error", { error: String(err) });
+    return res.status(500).json({ ok: false, error: "Internal error" });
+  }
+});
 
+export const suggest = onRequest({ region: REGION }, async function (req, res) {
+  try {
+    applyCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).end();
+
+    const q =
+      (req.method === "GET" && (req.query.q || req.query.query)) ||
+      (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
+
+    if (!q) {
+      return res.status(200).json({
+        ok: true,
+        message: "Pass ?q=term for suggestions",
+        rules_loaded: RULES.length
+      });
+    }
+
+    const limit = parseIntSafe(req.query.limit, 8);
+    const suggestions = suggestRules({ q: String(q), limit: limit });
+
+    logger.info({ event: "suggest", q: q, count: suggestions.length });
     return res.status(200).json({
       ok: true,
       query: q,
       limit: limit,
-      offset: offset,
-      highlight: highlightFlag,
-      hits: result.hits,
-      results: result.results,
+      suggestions: suggestions
     });
   } catch (err) {
-    logger.error("rulebook_error", { error: String(err) });
+    logger.error("suggest_error", { error: String(err) });
     return res.status(500).json({ ok: false, error: "Internal error" });
   }
 });

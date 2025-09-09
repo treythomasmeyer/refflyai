@@ -1,13 +1,16 @@
 /* apps/functions/index.js  (ESM, Node 20, 2nd-gen Functions)
- * RefflyAI — MLB Rulebook Search
+ * RefflyAI — MLB Rulebook Search API
  * Endpoints:
  *   - GET/POST /rulebook?q=... [&limit=&offset=&highlight=1]
  *   - GET/POST /suggest?q=... [&limit=]
+ *   - GET       /ruleById?id=...
+ *   - GET       /ruleByCitation?citation=...
  *
  * Features:
  * - Friendlier titles & citations
- * - Synonyms loaded from data/synonyms.json (with safe defaults fallback)
+ * - Synonyms loaded from data/synonyms.json (fallback defaults)
  * - CORS: PRODUCTION ONLY (https://reffly-search.vercel.app)
+ * - Basic per-IP rate limiting (env-configurable)
  * - Structured logs
  * - No template literals (avoids CI masking quirks)
  */
@@ -30,6 +33,11 @@ const PROD_ORIGIN = "https://reffly-search.vercel.app";
 function isAllowedOrigin(origin) {
   return origin === PROD_ORIGIN;
 }
+
+// Rate limit (simple, per instance). Configure via env if desired.
+const RL_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
+const RL_MAX = parseInt(process.env.RATE_LIMIT_MAX || "60", 10);
+const RL_BUCKET = new Map(); // ip -> [timestamps]
 
 // --- Load rulebook JSON once per instance ---------------------------------
 const RULES_PATH = path.join(__dirname, "data", "mlbrules.json");
@@ -114,6 +122,8 @@ function getCitation(rule) {
   for (let i = 0; i < candidates.length; i++) if (candidates[i]) return candidates[i];
   return "";
 }
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function safeWordRegex(term) { try { return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i"); } catch (_e) { return null; } }
 function expandQueryWithSynonyms(q) {
   const terms = [q];
   const base = lc(q);
@@ -125,13 +135,10 @@ function expandQueryWithSynonyms(q) {
       for (let j = 0; j < alts.length; j++) if (terms.indexOf(alts[j]) === -1) terms.push(alts[j]);
     }
   }
-  // uniq
   const uniq = [];
   for (let i = 0; i < terms.length; i++) if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
   return uniq;
 }
-function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function safeWordRegex(term) { try { return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i"); } catch (_e) { return null; } }
 function scoreRule(rule, queries) {
   const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
@@ -186,7 +193,40 @@ function highlight(text, queries) {
 function parseBool(v, def) { if (v == null) return !!def; const s = String(v).toLowerCase(); return s === "1" || s === "true" || s === "yes"; }
 function parseIntSafe(v, def) { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : def; }
 
-// --- Core search -----------------------------------------------------------
+// --- Rule lookup helpers ---------------------------------------------------
+function normalizeId(x) {
+  if (x == null) return "";
+  return String(x).trim();
+}
+function normalizeCitation(x) {
+  if (x == null) return "";
+  return String(x).trim().replace(/\s+/g, " ");
+}
+function findById(id) {
+  const want = normalizeId(id);
+  for (let i = 0; i < RULES.length; i++) {
+    const r = RULES[i];
+    const ids = [r.id, r.rule_id, r.ruleId];
+    for (let j = 0; j < ids.length; j++) {
+      if (normalizeId(ids[j]) === want) return r;
+    }
+  }
+  return null;
+}
+function findByCitation(c) {
+  const want = normalizeCitation(c).toLowerCase();
+  for (let i = 0; i < RULES.length; i++) {
+    const r = RULES[i];
+    const cands = [r.citation, r.citation1, r.rule_id, r.ruleId];
+    for (let j = 0; j < cands.length; j++) {
+      const got = normalizeCitation(cands[j]).toLowerCase();
+      if (got && got === want) return r;
+    }
+  }
+  return null;
+}
+
+// --- Search + Suggest ------------------------------------------------------
 function searchRules(opts) {
   const q = opts.q;
   const limit = opts.limit || 5;
@@ -228,7 +268,6 @@ function searchRules(opts) {
   return { hits: scored.length, results: results };
 }
 
-// --- Suggest (typeahead) ---------------------------------------------------
 function suggestRules(opts) {
   const q = clean(opts.q || "");
   const limit = opts.limit || 8;
@@ -236,7 +275,6 @@ function suggestRules(opts) {
 
   const queries = expandQueryWithSynonyms(q);
 
-  // Heavier weight on title/citation for suggestions
   function scoreForSuggest(rule) {
     const title = lc(buildTitle(rule));
     const cit = lc(getCitation(rule));
@@ -262,7 +300,6 @@ function suggestRules(opts) {
   }
   scored.sort(function (a, b) { return b.s - a.s; });
 
-  // Unique by title+citation to avoid dup rows
   const seen = {};
   const out = [];
   for (let i = 0; i < scored.length && out.length < limit; i++) {
@@ -281,7 +318,7 @@ function suggestRules(opts) {
   return out;
 }
 
-// --- CORS helper -----------------------------------------------------------
+// --- CORS + Rate Limiting --------------------------------------------------
 function applyCors(req, res) {
   const origin = req.headers.origin || "";
   if (isAllowedOrigin(origin)) {
@@ -292,12 +329,38 @@ function applyCors(req, res) {
     res.setHeader("Access-Control-Max-Age", "86400");
   }
 }
+function clientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0].trim();
+  const real = req.headers["x-real-ip"];
+  if (typeof real === "string" && real.length > 0) return real.trim();
+  return (req.ip || "").toString();
+}
+function rateLimited(req, res) {
+  const ip = clientIp(req) || "unknown";
+  const now = Date.now();
+  const arr = RL_BUCKET.get(ip) || [];
+  const fresh = [];
+  for (let i = 0; i < arr.length; i++) {
+    if (now - arr[i] <= RL_WINDOW_MS) fresh.push(arr[i]);
+  }
+  if (fresh.length >= RL_MAX) {
+    res.setHeader("Retry-After", Math.ceil(RL_WINDOW_MS / 1000).toString());
+    res.status(429).json({ ok: false, error: "Rate limit exceeded" });
+    logger.warn("rate_limited", { ip: ip, window_ms: RL_WINDOW_MS, max: RL_MAX });
+    return true;
+  }
+  fresh.push(now);
+  RL_BUCKET.set(ip, fresh);
+  return false;
+}
 
 // --- HTTP handlers ---------------------------------------------------------
 export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
     applyCors(req, res);
     if (req.method === "OPTIONS") return res.status(204).end();
+    if (rateLimited(req, res)) return;
 
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
@@ -319,11 +382,11 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
     const offset = parseIntSafe(req.query.offset, 0);
     const highlightFlag = parseBool(req.query.highlight, false);
 
-    const result = searchRules({ q: q, limit: limit, offset: offset, doHighlight: highlightFlag });
+    const result = searchRules({ q: String(q), limit: limit, offset: offset, doHighlight: highlightFlag });
 
-    logger.info({ event: "search", q: q, hits: result.hits, limit: limit, offset: offset });
+    logger.info({ event: "search", q: String(q), hits: result.hits, limit: limit, offset: offset });
     return res.status(200).json({
-      ok: true, query: q, limit: limit, offset: offset, highlight: highlightFlag,
+      ok: true, query: String(q), limit: limit, offset: offset, highlight: highlightFlag,
       hits: result.hits, results: result.results,
     });
   } catch (err) {
@@ -336,6 +399,7 @@ export const suggest = onRequest({ region: REGION }, async function (req, res) {
   try {
     applyCors(req, res);
     if (req.method === "OPTIONS") return res.status(204).end();
+    if (rateLimited(req, res)) return;
 
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
@@ -352,15 +416,55 @@ export const suggest = onRequest({ region: REGION }, async function (req, res) {
     const limit = parseIntSafe(req.query.limit, 8);
     const suggestions = suggestRules({ q: String(q), limit: limit });
 
-    logger.info({ event: "suggest", q: q, count: suggestions.length });
+    logger.info({ event: "suggest", q: String(q), count: suggestions.length });
     return res.status(200).json({
       ok: true,
-      query: q,
+      query: String(q),
       limit: limit,
       suggestions: suggestions
     });
   } catch (err) {
     logger.error("suggest_error", { error: String(err) });
+    return res.status(500).json({ ok: false, error: "Internal error" });
+  }
+});
+
+export const ruleById = onRequest({ region: REGION }, async function (req, res) {
+  try {
+    applyCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (rateLimited(req, res)) return;
+
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
+
+    const r = findById(id);
+    if (!r) return res.status(404).json({ ok: false, error: "Not found" });
+
+    logger.info({ event: "ruleById", id: String(id) });
+    return res.status(200).json({ ok: true, rule: r });
+  } catch (err) {
+    logger.error("ruleById_error", { error: String(err) });
+    return res.status(500).json({ ok: false, error: "Internal error" });
+  }
+});
+
+export const ruleByCitation = onRequest({ region: REGION }, async function (req, res) {
+  try {
+    applyCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (rateLimited(req, res)) return;
+
+    const c = req.query.citation || req.query.c;
+    if (!c) return res.status(400).json({ ok: false, error: "Missing citation" });
+
+    const r = findByCitation(c);
+    if (!r) return res.status(404).json({ ok: false, error: "Not found" });
+
+    logger.info({ event: "ruleByCitation", citation: String(c) });
+    return res.status(200).json({ ok: true, rule: r });
+  } catch (err) {
+    logger.error("ruleByCitation_error", { error: String(err) });
     return res.status(500).json({ ok: false, error: "Internal error" });
   }
 });

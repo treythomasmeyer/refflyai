@@ -2,7 +2,7 @@
  * RefflyAI — MLB Rulebook Search
  * - GET/POST /rulebook?q=... with ?limit & ?offset; &highlight=1
  * - Friendlier titles & consistent citations
- * - Lightweight synonyms
+ * - Synonyms loaded from data/synonyms.json (optional), with safe defaults
  * - CORS: PRODUCTION ONLY (https://reffly-search.vercel.app)
  * - Structured logs
  * - No template literals (avoids CI masking quirks)
@@ -27,16 +27,6 @@ function isAllowedOrigin(origin) {
   return origin === PROD_ORIGIN;
 }
 
-// --- Synonyms (starter) ----------------------------------------------------
-const SYNONYMS = {
-  "offensive interference": ["batter’s interference", "batter interference"],
-  "batter interference": ["offensive interference", "batter’s interference"],
-  "balks": ["balk"],
-  "tag up": ["retouch", "time play"],
-  "obstruction": ["fielder obstruction"],
-  "infield fly": ["ifr", "infield fly rule"],
-};
-
 // --- Load rulebook JSON once per instance ---------------------------------
 const RULES_PATH = path.join(__dirname, "data", "mlbrules.json");
 
@@ -52,6 +42,60 @@ try {
   logger.error("rulebook_load_failed", { error: String(err) });
   RULES = [];
   FIELD_KEYS = [];
+}
+
+// --- Synonyms --------------------------------------------------------------
+// Safe defaults; can be overridden/extended by data/synonyms.json
+const DEFAULT_SYNONYMS = {
+  "offensive interference": ["batter interference", "batters interference", "batter’s interference"],
+  "batter interference": ["offensive interference", "batter’s interference"],
+  "catcher's interference": ["catchers interference", "batter interference", "offensive interference"],
+  "obstruction": ["fielder obstruction", "obstructing the runner"],
+  "infield fly": ["infield fly rule", "ifr"],
+  "ifr": ["infield fly", "infield fly rule"],
+  "balks": ["balk"],
+  "tag up": ["retouch", "time play"],
+  "appeal play": ["appeal"],
+  "force play": ["force out"],
+  "time play": ["timing play"],
+  "foul tip": ["caught foul tip"],
+  "ground-rule double": ["automatic double"],
+  "dead ball": ["ball is dead"],
+  "check swing": ["swing attempt", "did he go"],
+  "bunt attempt": ["offer at bunt", "squared to bunt"]
+};
+
+function isArrayOfStrings(v) {
+  if (!Array.isArray(v)) return false;
+  for (let i = 0; i < v.length; i++) {
+    if (typeof v[i] !== "string") return false;
+  }
+  return true;
+}
+
+const SYN_PATH = path.join(__dirname, "data", "synonyms.json");
+let SYNONYMS = { ...DEFAULT_SYNONYMS };
+
+try {
+  const synRaw = fs.readFileSync(SYN_PATH, "utf8");
+  const fileSyn = JSON.parse(synRaw);
+  if (fileSyn && typeof fileSyn === "object" && !Array.isArray(fileSyn)) {
+    const merged = { ...DEFAULT_SYNONYMS };
+    const keys = Object.keys(fileSyn);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = fileSyn[k];
+      if (typeof k === "string" && isArrayOfStrings(v)) {
+        merged[k] = v;
+      }
+    }
+    SYNONYMS = merged;
+    logger.info("synonyms_loaded", { entries: Object.keys(SYNONYMS).length, path: SYN_PATH });
+  } else {
+    logger.warn("synonyms_invalid_format", { path: SYN_PATH });
+  }
+} catch (e) {
+  logger.info("synonyms_file_not_loaded", { path: SYN_PATH, note: "using defaults", error: String(e) });
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -80,13 +124,18 @@ function getCitation(rule) {
 function expandQueryWithSynonyms(q) {
   const terms = [q];
   const base = lc(q);
-  Object.keys(SYNONYMS).forEach(function (key) {
+  const keys = Object.keys(SYNONYMS);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
     if (base.indexOf(key) !== -1) {
-      SYNONYMS[key].forEach(function (alt) {
+      const alts = SYNONYMS[key];
+      for (let j = 0; j < alts.length; j++) {
+        const alt = alts[j];
         if (terms.indexOf(alt) === -1) terms.push(alt);
-      });
+      }
     }
-  });
+  }
+  // uniq
   const uniq = [];
   for (let i = 0; i < terms.length; i++) if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
   return uniq;
@@ -97,17 +146,22 @@ function scoreRule(rule, queries) {
   const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
   const blob = {};
-  Object.keys(fields).forEach(function (f) { blob[f] = lc(clean(rule[f])); });
+  const fks = Object.keys(fields);
+  for (let i = 0; i < fks.length; i++) {
+    const f = fks[i];
+    blob[f] = lc(clean(rule[f]));
+  }
   for (let qi = 0; qi < queries.length; qi++) {
     const term = lc(queries[qi]);
     const termRe = safeWordRegex(term);
-    Object.keys(fields).forEach(function (f) {
+    for (let k = 0; k < fks.length; k++) {
+      const f = fks[k];
       const wt = fields[f];
       const hay = blob[f] || "";
-      if (!hay) return;
+      if (!hay) continue;
       if (termRe && termRe.test(hay)) score += 5 * wt;
       if (hay.indexOf(term) >= 0) score += 1 * wt;
-    });
+    }
     if (blob.content && blob.content.indexOf(term) !== -1) score += 3;
   }
   return score;

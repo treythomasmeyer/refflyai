@@ -3,7 +3,7 @@
  * - GET/POST /rulebook?q=... with ?limit & ?offset; &highlight=1
  * - Friendlier titles & consistent citations
  * - Lightweight synonyms
- * - CORS: allow your prod domain, any *.vercel.app preview, and localhost dev
+ * - CORS: PRODUCTION ONLY (https://reffly-search.vercel.app)
  * - Structured logs
  * - No template literals (avoids CI masking quirks)
  */
@@ -21,24 +21,10 @@ const __dirname = path.dirname(__filename);
 // --- Config ----------------------------------------------------------------
 const REGION = "us-central1";
 
-// Exact dev/prod origins
-const ALLOW_EXACT = new Set([
-  "https://reffly-search.vercel.app", // production URL
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-]);
-
-// Allow Vercel preview deployments: *.vercel.app
+// Strict CORS: prod only
+const PROD_ORIGIN = "https://reffly-search.vercel.app";
 function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  if (ALLOW_EXACT.has(origin)) return true;
-  try {
-    const u = new URL(origin);
-    if (u.hostname.endsWith(".vercel.app")) return true;
-  } catch (_e) {}
-  return false;
+  return origin === PROD_ORIGIN;
 }
 
 // --- Synonyms (starter) ----------------------------------------------------
@@ -119,8 +105,8 @@ function scoreRule(rule, queries) {
       const wt = fields[f];
       const hay = blob[f] || "";
       if (!hay) return;
-      if (termRe && termRe.test(hay)) score += 5 * wt; // whole word
-      if (hay.indexOf(term) >= 0) score += 1 * wt;     // substring
+      if (termRe && termRe.test(hay)) score += 5 * wt;
+      if (hay.indexOf(term) >= 0) score += 1 * wt;
     });
     if (blob.content && blob.content.indexOf(term) !== -1) score += 3;
   }
@@ -201,7 +187,7 @@ function searchRules(opts) {
 // --- HTTP handler ----------------------------------------------------------
 export const rulebook = onRequest({ region: REGION }, async function (req, res) {
   try {
-    // Strict CORS
+    // Strict CORS (prod only)
     const origin = req.headers.origin || "";
     if (isAllowedOrigin(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);

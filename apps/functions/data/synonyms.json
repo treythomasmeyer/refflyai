@@ -1,0 +1,18 @@
+{
+  "offensive interference": ["batter interference", "batters interference", "batter’s interference"],
+  "batter interference": ["offensive interference", "batter’s interference"],
+  "catcher's interference": ["catchers interference", "batter interference", "offensive interference"],
+  "obstruction": ["fielder obstruction", "obstructing the runner"],
+  "infield fly": ["infield fly rule", "ifr"],
+  "ifr": ["infield fly", "infield fly rule"],
+  "balks": ["balk"],
+  "tag up": ["retouch", "time play"],
+  "appeal play": ["appeal"],
+  "force play": ["force out"],
+  "time play": ["timing play"],
+  "foul tip": ["caught foul tip"],
+  "ground-rule double": ["automatic double"],
+  "dead ball": ["ball is dead"],
+  "check swing": ["swing attempt", "did he go"],
+  "bunt attempt": ["offer at bunt", "squared to bunt"]
+}

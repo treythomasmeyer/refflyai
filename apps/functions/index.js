@@ -85,29 +85,18 @@ function expandQueryWithSynonyms(q) {
   for (let i = 0; i < terms.length; i++) if (uniq.indexOf(terms[i]) === -1) uniq.push(terms[i]);
   return uniq;
 }
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function safeWordRegex(term) {
-  try {
-    return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i");
-  } catch (_e) {
-    return null;
-  }
-}
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function safeWordRegex(term) { try { return new RegExp("\\b" + escapeRegExp(term) + "\\b", "i"); } catch { return null; } }
 function scoreRule(rule, queries) {
   const fields = { title: 3, subtitle: 2, content: 4, references: 1, parentRule: 2, subsection: 2 };
   let score = 0;
   const blob = {};
-  Object.keys(fields).forEach(function (f) {
-    blob[f] = lc(clean(rule[f]));
-  });
+  Object.keys(fields).forEach(function (f) { blob[f] = lc(clean(rule[f])); });
   for (let qi = 0; qi < queries.length; qi++) {
     const term = lc(queries[qi]);
     const termRe = safeWordRegex(term);
     Object.keys(fields).forEach(function (f) {
-      const wt = fields[f];
-      const hay = blob[f] || "";
+      const wt = fields[f]; const hay = blob[f] || "";
       if (!hay) return;
       if (termRe && termRe.test(hay)) score += 5 * wt;
       if (hay.indexOf(term) >= 0) score += 1 * wt;
@@ -123,8 +112,7 @@ function makeExcerpt(text, queries, maxLen) {
   const base = lc(t);
   let foundAt = -1;
   for (let i = 0; i < queries.length; i++) {
-    const q = lc(queries[i]);
-    const idx = base.indexOf(q);
+    const q = lc(queries[i]); const idx = base.indexOf(q);
     if (idx !== -1 && (foundAt === -1 || idx < foundAt)) foundAt = idx;
   }
   if (foundAt === -1) return t.length <= MAX ? t : t.slice(0, MAX - 1).trimEnd() + "…";
@@ -136,28 +124,15 @@ function makeExcerpt(text, queries, maxLen) {
 }
 function highlight(text, queries) {
   if (!text) return "";
-  let out = text;
-  const seen = {};
+  let out = text; const seen = {};
   for (let i = 0; i < queries.length; i++) {
-    const term = (queries[i] || "").trim();
-    if (!term || seen[term]) continue;
-    seen[term] = true;
-    try {
-      const re = new RegExp("(" + escapeRegExp(term) + ")", "gi");
-      out = out.replace(re, "«$1»");
-    } catch (_e) {}
+    const term = (queries[i] || "").trim(); if (!term || seen[term]) continue; seen[term] = true;
+    try { const re = new RegExp("(" + escapeRegExp(term) + ")", "gi"); out = out.replace(re, "«$1»"); } catch {}
   }
   return out;
 }
-function parseBool(v, def) {
-  if (v === undefined || v === null) return !!def;
-  const s = String(v).toLowerCase();
-  return s === "1" || s === "true" || s === "yes";
-}
-function parseIntSafe(v, def) {
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) && n >= 0 ? n : def;
-}
+function parseBool(v, def) { if (v == null) return !!def; const s = String(v).toLowerCase(); return s === "1" || s === "true" || s === "yes"; }
+function parseIntSafe(v, def) { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : def; }
 
 // --- Core search -----------------------------------------------------------
 function searchRules(opts) {
@@ -177,9 +152,7 @@ function searchRules(opts) {
     const s = scoreRule(r, queries);
     if (s > 0) scored.push({ r: r, s: s });
   }
-  scored.sort(function (a, b) {
-    return b.s - a.s;
-  });
+  scored.sort(function (a, b) { return b.s - a.s; });
 
   const slice = scored.slice(offset, offset + limit);
   const results = [];
@@ -193,17 +166,11 @@ function searchRules(opts) {
     let excerpt = makeExcerpt(content, queries, 240);
     if (doHighlight && excerpt) excerpt = highlight(excerpt, queries);
     results.push({
-      id: String(
-        r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))
-      ),
-      title: title,
-      citation: citation,
-      score: s,
-      excerpt: excerpt,
+      id: String(r.id != null ? r.id : (r.rule_id != null ? r.rule_id : (r.ruleId != null ? r.ruleId : ""))),
+      title, citation, score: s, excerpt
     });
   }
-
-  return { hits: scored.length, results: results };
+  return { hits: scored.length, results };
 }
 
 // --- HTTP handler ----------------------------------------------------------
@@ -214,16 +181,12 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Max-Age", "86400");
-
-    if (req.method === "OPTIONS") {
-      return res.status(204).end();
-    }
+    if (req.method === "OPTIONS") return res.status(204).end();
 
     // Health-like response if no query provided
     const q =
       (req.method === "GET" && (req.query.q || req.query.query)) ||
       (req.method === "POST" && (req.body && (req.body.q || req.body.query)));
-
     if (!q) {
       const example1 = "https://us-central1-primal-prism-471217-c5.cloudfunctions.net/rulebook?q=interference";
       const example2 = "https://us-central1-primal-prism-471217-c5.cloudfunctions.net/rulebook?q=infield+fly&limit=3&highlight=1";
@@ -241,24 +204,14 @@ export const rulebook = onRequest({ region: REGION }, async function (req, res) 
     const offset = parseIntSafe(req.query.offset, 0);
     const highlightFlag = parseBool(req.query.highlight, false);
 
-    const result = searchRules({
-      q: q,
-      limit: limit,
-      offset: offset,
-      doHighlight: highlightFlag,
-    });
+    const result = searchRules({ q, limit, offset, doHighlight: highlightFlag });
 
     // Structured log
-    logger.info({ event: "search", q: q, hits: result.hits, limit: limit, offset: offset });
+    logger.info({ event: "search", q, hits: result.hits, limit, offset });
 
     return res.status(200).json({
-      ok: true,
-      query: q,
-      limit: limit,
-      offset: offset,
-      highlight: highlightFlag,
-      hits: result.hits,
-      results: result.results,
+      ok: true, query: q, limit, offset, highlight: highlightFlag,
+      hits: result.hits, results: result.results,
     });
   } catch (err) {
     logger.error("rulebook_error", { error: String(err) });
